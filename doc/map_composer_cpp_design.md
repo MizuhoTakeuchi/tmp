@@ -33,13 +33,20 @@ classDiagram
     MapComposer "1" *-- "N" map_info
 ```
 
-補助的な内部関数（無名関数/ローカル関数として実装）
-- 円中心抽出: `extract_circle_centers(const Cloud&) -> vector<Vector2d>`
-- 円中心からの剛体推定: `estimate_from_centers(const vector<Vector2d>& S, const vector<Vector2d>& D) -> Isometry2d`
-- L字特徴抽出: `extract_L_features(const Cloud&) -> vector<LFeat>`（2直線分解＋交点＋端点抽出）
-- L字からの剛体推定: `estimate_from_L(const LFeat& s, const LFeat& d) -> Isometry2d`（単一候補）
-- L字の候補列挙: `estimate_from_L_candidates(const LFeat& s, const LFeat& d) -> vector<Isometry2d>`（line1→line1 / line1→line2）
-- 端点整合スコア: `endpoint_score(const LFeat& s, const LFeat& d, const Isometry2d& iso) -> double`
+補助的な内部関数（無名名前空間に実装）
+- L字関連  
+  - `detectLFeatures(const Cloud&) -> vector<LFeat>`: PCA＋反復割当で L 形状を抽出  
+  - `estimateFromL(const LFeat&, const LFeat&) -> Isometry2d`: 腕方向の整合から単一候補を算出  
+  - `generateLCandidates(const LFeat&, const LFeat&) -> vector<Isometry2d>`: 単一直交対の向き曖昧性（±180°）を列挙  
+  - `endpointScore(...) -> double`: 変換後の端点整合度を算定  
+  - `estimateFromLs(...) -> Isometry2d`: 複数 L 特徴を持つ場合の総合的な候補評価  
+  - `chooseBestLPair(...) -> pair<int,int>`: 単一 L ケース向けの最適ペア選択
+- 円形ランドマーク  
+  - `detectCircleCenters(const Cloud&) -> vector<Vector2d>`: ε 近傍クラスタリング＋Kasa 法で中心抽出  
+  - `estimateFromCircleCenters(const vector<Vector2d>&, const vector<Vector2d>&) -> Isometry2d`: 2点RANSAC→Procrustes
+- 共通ユーティリティ  
+  - `pointLineDistance`, `pointsAlignmentMSE`, `robustMSEToTarget`  
+  - `edgeKey`, `composeIso2D`, `invertIso2D`
 
 ## データ構造
 - `using Point = pcl::PointXYZI; using Cloud = pcl::PointCloud<Point>;`
@@ -93,28 +100,26 @@ flowchart TD
 ```
 
 1) 特徴量抽出（円型）
-- 近傍グラフ（ε=0.12m）で連結成分クラスタリング
-- クラスタ毎に Kasa 法で円当てはめ（正則化: 残差 `resn < 0.08`、半径 `R∈[0.015, 0.05]`）
-- 有効クラスタの円中心を特徴点として収集
+- ε = 0.12 m の近傍グラフで連結成分を抽出
+- 各クラスタに Kasa 法を適用し、半径 `R∈[0.015,0.05]` かつ正規化残差 `resn < 0.08` の場合に円中心を採用
 
 2) 特徴量抽出（L字型）
-- PCA で主方向 `d1` を推定し、点群を「line1近傍」と「それ以外」に分ける
-- 「それ以外」にPCA適用で `d2` を初期化、以降は最近傍線への距離で割当→PCA再フィットを反復（6回）
-- 2直線の交点 `lc`、各線の投影区間 `[tmin, tmax]` から腕長 `l1, l2` を算出（交点からの最大距離）
-- 角度 `ldeg = acos(|d1·d2|)`、端点相対距離≤0.5、各腕長≥0.2m を満たす場合にLとして受理
-- 腕長の長い直線を line1 に正規化し、さらに `d1/d2` の符号を「交点から遠い端点側に向く」よう正規化
-- 端点 `e1a,e1b,e2a,e2b` を保存（後段の端点整合評価に利用）
+- PCA で主成分 `d1` を初期化し、点群を「線1」「線2」に分類（10分位・90分位を初期クラスタ中心に使用）
+- 最近傍線への割当→PCAによる再フィットを最大6回反復し、直交する2直線を推定
+- 投影区間 `[tmin, tmax]` から腕長 `l1, l2` を算出し、角度 `ldeg` が20°以上、端点が区間端の50%以内にある場合のみ受理
+- 腕長の長い直線を line1 に正規化し、各方向ベクトルは交点から遠い端点に向くよう符号を調整
 
 3) 隣接辺ごとの初期変換推定
-- 円中心が両側で2点以上: 2点対応RANSAC（300反復）で仮説→最近傍一致でインライア評価→Procrustes で (R,t) 再推定
-- L字：
-  - 複数L: `estimate_from_L` の候補でインライア数→角点近傍のロバスト距離→MSEの優先で選択
-  - 単一L: `estimate_from_L_candidates` による2候補を「端点整合スコア」を最優先に、次いで全点群ロバスト距離→角点近傍ロバスト距離→MSEの順に選択
+- 円中心が双方で2点以上: 2点RANSAC（300反復）で仮説生成→対応割当→Procrustes で最終変換を復元
+- L字:
+  - 複数 L を持つ場合: `estimateFromLs` が端点整合、ロバストMSE、インライア数を組み合わせて最良候補を決定
+  - 単一 L の場合: `chooseBestLPair` でペアを決定後、`generateLCandidates` の2候補を端点整合→全点ロバスト誤差→角点近傍誤差→インライアの順で評価
+- どちらの特徴も利用できない場合は `icp2D`（max_corr=2.0）で代替推定
 
-4) BFS による参照（map1）への連鎖合成＋候補比較
-- 根を map1(=index 0) とし、未訪問ノードに対して `v->1 = (v->u) o (u->1)` を適用
-- 単一Lの辺では `v->u` の2候補を保持し、訪問済みノードを集約したターゲット点群に対するロバスト距離が小さい候補を採用
-- 仕上げとして、各ノードの変換を重心回りに±180°反転した場合の全体ロバスト距離を比較し、改善する場合のみ反転採用（グローバル整合）
+4) BFS による参照（map1）への連鎖合成とグローバル整合
+- 根を map1 とし、`edgeKey` で識別した `v->u` 候補群から `robustMSEToTarget` により訪問済み点群との整合が最良なものを選択
+- 各ノードの変換は `composeIso2D` で連鎖合成
+- BFS完了後、各ノードについて重心回りの180°回転候補を評価し、ロバスト誤差が改善する場合のみ置き換える
 
 ### 数式・変換仕様
 - 2D回転行列 `R(θ) = [[cosθ, -sinθ],[sinθ, cosθ]]`
@@ -129,10 +134,10 @@ flowchart TD
 - 端点整合の重み付け: 単一Lでは端点整合を最優先、複数Lでは端点整合はタイブレークに使用
 
 ## 計算量の目安
-- 円クラスタリング: `O(N^2)`（ペア距離, N=点数）
-- 円当てはめ: クラスタごとに `O(M)`（線形最小二乗）
-- L抽出: PCA（SVD）`O(M)〜O(M^2)` を数回、割当 `O(M)` を反復
-- RANSAC: 反復数×対応計算（中心点数に依存）
+- 円クラスタリング: `O(N^2)`（近傍探索を全ペアで評価）
+- 円当てはめ: 各クラスタで `O(M)` の線形最小二乗
+- L抽出: PCA（SVD）と距離計算を複数回実施（総じて `O(M^2)` 以内）
+- RANSAC: 反復300回 × 対応探索（中心点数に依存）
 - BFS: 辺数 `|E|` に線形
 
 ## 例外・エラー処理
@@ -152,5 +157,5 @@ flowchart TD
 - 出力: 標準出力に `mapK -> map1: t=(tx, ty), theta_deg=θ`、変換済みPCD（任意）
 
 ## 妥当性確認
-- `data/pcd/circle`: ドキュメントの期待変換と一致（`doc/validation_cpp.md` 参照）
-- `data/pcd/L`: map2→map1, map3→map1 ともに（-75°, +20°）へ収束。`out/plots/pcd_L_overlay.png` にて重畳を確認。
+- `data/pcd/circle`: ドキュメントの期待変換と一致（`doc/validation_cpp.md` 参照）。`out/circle_refactor.png` で重畳結果を確認。
+- `data/pcd/L`: map2→map1, map3→map1 ともに（-75°, +20°）へ収束し、`out/L_refactor.png` に可視化を保存。
